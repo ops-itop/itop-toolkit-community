@@ -316,16 +316,71 @@ function MakeDictionaryFile($sLangCode, $sLangName, $sLangLocName, $sSourceFile,
 	return true;
 }
 
+// int & tinyint size not present anymore was added in MySQL 8.0.17 
+// (as stated in the 8.0.17 released notes)
+// https://dev.mysql.com/doc/relnotes/mysql/8.0/en/news-8-0-17.html#mysqld-8-0-17-deprecation-removal
+function FixMySQL8($sIssue) {
+	$sPattern = "/field .*: found <code>(int|tinyint|varchar.*?)( DEFAULT [0-9]+| unsigned)?<\/code> while expecting <code>(INT|TINYINT|VARCHAR)\([0-9]+\)( DEFAULT [0-9]+| UNSIGNED| CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci DEFAULT.*)?<\/code>/";
+	preg_match_all($sPattern, $sIssue, $out);
+	if (count($out[0]) > 0) {
+		return True;
+	} else {
+		return false;
+	}
+}
+
+
+function IgnoreAdd(&$aIgnore, $sClass, $sAttCode, $iIndex) {
+	if (!array_key_exists($sClass, $aIgnore)) {
+		$aIgnore[$sClass] = [];
+	}
+	if (!array_key_exists($sAttCode, $aIgnore[$sClass])) {
+		$aIgnore[$sClass][$sAttCode] = [];
+	}
+	$aIgnore[$sClass][$sAttCode][] = $iIndex;
+}
+
+function IgnoreQueriesAdd(&$aIgnoreQueries, $sQuery) {
+	preg_match_all('/ALTER TABLE `(.*?)` (.*)$/', $sQuery, $out);
+	if(count($out)>2) {
+		$sTable = $out[1][0];
+		$sOp = $out[2][0];
+		if(!array_key_exists($sTable, $aIgnoreQueries)) {
+			$aIgnoreQueries[$sTable] = [];
+		}
+		$aIgnoreQueries[$sTable][] = $sOp;
+	} 
+}
+
+// 拼接成 $aCondensedQueries 格式
+function IgnoreQueriesFix($aIgnoreQueries) {
+	$aQueries = [];
+	foreach($aIgnoreQueries as $sTable => $aOps) {
+		$sQuery = implode(", ", $aOps);
+		$aQueries[] = "ALTER TABLE `" . $sTable . "` " . $sQuery;
+	}
+	return $aQueries;
+}
+
 function CheckDBSchema()
 {
 	$aAnalysis = array();
 	list($aErrors, $aSugFix, $aCondensedQueries) = MetaModel::DBCheckFormat();
+	// Fix MySQL 8
+	$aIgnore = [];
+	$aIgnoreQueries = [];
 	foreach ($aErrors as $sClass => $aTarget)
 	{
 		foreach ($aTarget as $sAttCode => $aIssues)
 		{
+			$i = -1;
 			foreach ($aIssues as $sIssue)
 			{
+				$i++;
+				if (FixMySQL8($sIssue)) {
+					IgnoreAdd($aIgnore, $sClass, $sAttCode, $i);
+					continue;
+				}
 				$aAnalysis[$sClass]['table_issues'][$sAttCode][] = $sIssue;
 			}
 		}
@@ -334,16 +389,23 @@ function CheckDBSchema()
 	{
 		foreach ($aTarget as $sAttCode => $aQueries)
 		{
+			$i = -1;
 			foreach ($aQueries as $sQuery)
 			{
+				$i++;
 				if (!empty($sQuery))
 				{
+					if(array_key_exists($sClass, $aIgnore) && array_key_exists($sAttCode, $aIgnore[$sClass]) && in_array($i, $aIgnore[$sClass][$sAttCode])) {
+						IgnoreQueriesAdd($aIgnoreQueries, $sQuery);
+						continue;
+					}
 					$aAnalysis[$sClass]['table_fixes'][$sAttCode][] = $sQuery;
 				}
 			}
 		}
 	}
 	$sSQL = '';
+	$aCondensedQueries = array_diff($aCondensedQueries, IgnoreQueriesFix($aIgnoreQueries));
 	foreach ($aCondensedQueries as $sCondensedQuery)
 	{
 		$sSQL .= $sCondensedQuery;
